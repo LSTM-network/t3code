@@ -2487,6 +2487,34 @@ it.effect("refreshes pull requests after a provider stream exits with an error",
   }),
 );
 
+it.effect("settles a workspace handoff stream close as interrupted instead of provider error", () =>
+  Effect.gen(function* () {
+    const { written, finalEvents, observed } = yield* captureRootRunTermination({
+      key: "workspace-handoff-stream-close",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: () =>
+        Stream.fail(
+          new ProviderAdapter.ProviderAdapterEventStreamError({
+            driver,
+            providerSessionId: ProviderSessionId.make("session:workspace-handoff"),
+            cause: new Error("Workspace changed."),
+          }),
+        ),
+    });
+
+    assert.deepEqual(observed, ["run:interrupted", "pull-requests-refreshed"]);
+    assert.isFalse(written.some((item) => item.type === "error"));
+    assert.equal(
+      finalEvents.find((event) => event.type === "run.updated")?.payload.status,
+      "interrupted",
+    );
+    assert.equal(
+      finalEvents.find((event) => event.type === "provider-thread.updated")?.payload.status,
+      "idle",
+    );
+  }),
+);
+
 it.effect.each(["failure", "defect", "interrupt-failure", "ownership-lost"] as const)(
   "stops the live provider and background work before settling an ingestion %s",
   (failureMode) =>

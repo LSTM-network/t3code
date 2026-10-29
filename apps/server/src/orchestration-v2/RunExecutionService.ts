@@ -173,6 +173,21 @@ function childTurnsContinue(terminal: ProviderTerminalEvent): boolean {
   return terminal.status === "failed" && terminal.childTurnsContinue === true;
 }
 
+function isWorkspaceChangeEventStreamClose(error: unknown): boolean {
+  if (
+    typeof error !== "object" ||
+    error === null ||
+    !("_tag" in error) ||
+    error._tag !== "ProviderAdapterEventStreamError" ||
+    !("cause" in error)
+  )
+    return false;
+  return (
+    error.cause === "Workspace changed." ||
+    (error.cause instanceof Error && error.cause.message === "Workspace changed.")
+  );
+}
+
 /**
  * A running subagent stays with the run that launched it, which keeps ingesting until it ends;
  * taking it over too would store its events twice.
@@ -1036,6 +1051,7 @@ export const layer: Layer.Layer<
         const rootTerminalSeen = yield* Ref.make(false);
         const rootRunFinalized = yield* Ref.make(false);
         const providerThreadOwnerLost = yield* Ref.make(false);
+        const workspaceHandoffRequested = yield* Ref.make(false);
         const activeChildProviderTurns = yield* Ref.make<ReadonlySet<ProviderTurnId>>(new Set());
         const activeChildSubagents = yield* Ref.make<ReadonlyMap<NodeId, ThreadId>>(new Map());
         const activeBackgroundTurnItems = yield* Ref.make<
@@ -1446,11 +1462,34 @@ export const layer: Layer.Layer<
           ),
           Stream.takeUntilEffect(() => shouldStopProviderEventIngestion),
           Stream.runDrain,
+          Effect.catchIf(isWorkspaceChangeEventStreamClose, () =>
+            Ref.set(workspaceHandoffRequested, true),
+          ),
           Effect.mapError((cause) => new RunExecutionIngestError({ runId: input.run.id, cause })),
           Effect.flatMap(() =>
             Effect.gen(function* () {
               const terminal = yield* Ref.get(terminalEvent);
               if (terminal === null) {
+                if (yield* Ref.get(workspaceHandoffRequested)) {
+                  const routing = yield* Ref.get(eventRouting);
+                  yield* finalizeRootRun({
+                    type: "turn.terminal",
+                    driver: input.providerThread.driver,
+                    providerThreadId: input.providerThread.id,
+                    providerTurnId:
+                      routing.rootProviderTurnId ??
+                      input.attempt.providerTurnId ??
+                      idAllocator.derive.providerTurn({
+                        driver: input.providerThread.driver,
+                        nativeTurnId: `workspace-handoff:${input.attempt.id}`,
+                      }),
+                    runOrdinal: input.run.ordinal,
+                    status: "interrupted",
+                    failure: null,
+                    threadDisposition: "reusable",
+                  });
+                  return;
+                }
                 // A session release interrupts or fails the stream; a clean
                 // end without a terminal means the run would never settle.
                 return yield* new RunExecutionIngestError({
@@ -1465,8 +1504,7 @@ export const layer: Layer.Layer<
               yield* finalizeRootRun(terminal);
             }),
           ),
-          // Server shutdown interrupts the subscription and leaves the run to
-          // restart recovery; every other failure fails the run.
+          // Shutdown leaves recovery to restart the run; other ingestion errors fail it.
           Effect.catchCauseIf(
             (cause) => !Cause.hasInterruptsOnly(cause),
             (cause) =>
